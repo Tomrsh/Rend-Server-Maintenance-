@@ -1,19 +1,13 @@
-const { 
-    default: makeWASocket, 
-    DisconnectReason, 
-    fetchLatestBaileysVersion,
-    makeCacheableSignalKeyStore,
-    delay
-} = require('@whiskeysockets/baileys');
-const { initializeApp } = require('firebase/app');
-const { getDatabase, ref, get, set, remove, push } = require('firebase/database');
 const express = require('express');
-const http = require('http');
-const socketIo = require('socket.io');
-const qrcode = require('qrcode');
-const pino = require('pino');
+const axios = require('axios');
+const firebase = require('firebase/compat/app');
+require('firebase/compat/database');
 
-// --- FIREBASE CONFIG --
+const app = express();
+app.use(express.json());
+
+// ================= [ CONFIGURATION ] =================
+// Apni Firebase Details Yahan Bharein
 const firebaseConfig = {
   apiKey: "AIzaSyAb7V8Xxg5rUYi8UKChEd3rR5dglJ6bLhU",
   authDomain: "t2-storage-4e5ca.firebaseapp.com",
@@ -25,231 +19,216 @@ const firebaseConfig = {
   measurementId: "G-K2KPMMC5C6"
 };
 
-const firebaseApp = initializeApp(firebaseConfig);
-const db = getDatabase(firebaseApp);
-const SESSION_PATH = 'wa_session_v7';
-const CHAT_PATH = 'wa_backups';
+// ================= [ BACKEND ENGINE ] =================
+firebase.initializeApp(firebaseConfig);
+const db = firebase.database();
+const sitesRef = db.ref('monitored_sites');
 
-const app = express();
-const server = http.createServer(app);
-const io = socketIo(server);
-const PORT = process.env.PORT || 3000;
+let activeIntervals = {};
 
-app.use(express.json());
-
-let sock;
-let isConnected = false;
-let qrCodeData = null;
-
-const cleanData = (obj) => JSON.parse(JSON.stringify(obj));
-
-async function useFirebaseAuthState() {
-    let creds;
-    const sessionRef = ref(db, SESSION_PATH + '/creds');
-    const snapshot = await get(sessionRef);
-    if (snapshot.exists()) {
-        creds = JSON.parse(JSON.stringify(snapshot.val()), (key, value) => {
-            if (value && typeof value === 'object' && value.type === 'Buffer') return Buffer.from(value.data);
-            return value;
+const performPing = async (id, url) => {
+    const startTime = Date.now();
+    try {
+        // Render sites ko active rakhne ke liye 15s timeout
+        const res = await axios.get(url, { 
+            timeout: 15000,
+            headers: { 'User-Agent': 'RenderAlive-Pro/3.0' }
         });
-    } else {
-        creds = require('@whiskeysockets/baileys').initAuthCreds();
+        
+        const responseTime = Date.now() - startTime;
+        sitesRef.child(id).update({
+            status: 'Online',
+            lastPing: new Date().toLocaleString(),
+            responseTime: responseTime + 'ms',
+            lastCode: res.status
+        });
+    } catch (error) {
+        sitesRef.child(id).update({
+            status: 'Offline',
+            lastPing: new Date().toLocaleString(),
+            lastCode: error.response ? error.response.status : 'ERR'
+        });
     }
-    return {
-        state: {
-            creds,
-            keys: makeCacheableSignalKeyStore({
-                get: async (type, ids) => {
-                    const res = {};
-                    for (const id of ids) {
-                        const itemSnap = await get(ref(db, `${SESSION_PATH}/keys/${type}-${id}`));
-                        if (itemSnap.exists()) res[id] = itemSnap.val();
-                    }
-                    return res;
-                },
-                set: async (data) => {
-                    for (const type in data) {
-                        for (const id in data[type]) {
-                            const val = data[type][id];
-                            const itemRef = ref(db, `${SESSION_PATH}/keys/${type}-${id}`);
-                            val ? await set(itemRef, cleanData(val)) : await remove(itemRef);
-                        }
-                    }
-                }
-            }, pino({ level: 'silent' }))
-        },
-        saveCreds: async () => await set(sessionRef, cleanData(creds))
-    };
-}
+};
 
-async function startWhatsApp() {
-    const { state, saveCreds } = await useFirebaseAuthState();
-    const { version } = await fetchLatestBaileysVersion();
-    sock = makeWASocket({ version, logger: pino({ level: 'silent' }), auth: state, browser: ["Master-V7", "Chrome", "1.0.0"] });
-    sock.ev.on('creds.update', saveCreds);
-    sock.ev.on('connection.update', async (update) => {
-        const { connection, lastDisconnect, qr } = update;
-        if (qr) { qrCodeData = await qrcode.toDataURL(qr); io.emit('qr', qrCodeData); }
-        if (connection === 'open') { isConnected = true; qrCodeData = null; io.emit('ready', true); }
-        if (connection === 'close') { isConnected = false; startWhatsApp(); }
-    });
-    sock.ev.on('messages.upsert', async m => {
-        const msg = m.messages[0];
-        if (!msg.message || msg.key.remoteJid === 'status@broadcast') return;
-        const jid = msg.key.remoteJid;
-        const name = msg.pushName || jid.split('@')[0];
-        const text = msg.message.conversation || msg.message.extendedTextMessage?.text || "Media Content";
-        const time = new Date().toLocaleTimeString();
-        const safeId = jid.replace(/[^a-zA-Z0-9]/g, '');
-        push(ref(db, `${CHAT_PATH}/${safeId}`), { sender: name, text, time, fromMe: msg.key.fromMe, jid: jid });
-    });
-}
+// Site monitoring logic
+sitesRef.on('value', (snapshot) => {
+    const sites = snapshot.val();
+    if (!sites) return;
 
-app.post('/send', async (req, res) => {
-    let { jid, message } = req.body;
-    if(!jid.includes('@')) jid = jid + '@s.whatsapp.net';
-    await sock.sendMessage(jid, { text: message });
-    res.json({ success: true });
+    Object.keys(sites).forEach(id => {
+        const site = sites[id];
+        
+        if (site.enabled && !activeIntervals[id]) {
+            console.log(`Starting Monitor: ${site.url}`);
+            // Pehla ping turant
+            performPing(id, site.url);
+            // Interval setup
+            const ms = (parseInt(site.interval) || 5) * 60 * 1000;
+            activeIntervals[id] = setInterval(() => performPing(id, site.url), ms);
+        } 
+        else if (!site.enabled && activeIntervals[id]) {
+            console.log(`Stopping Monitor: ${site.url}`);
+            clearInterval(activeIntervals[id]);
+            delete activeIntervals[id];
+        }
+    });
 });
 
+// ================= [ DASHBOARD UI ] =================
 app.get('/', (req, res) => {
     res.send(`
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Master V7</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RenderAlive | Professional Uptime</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <script src="/socket.io/socket.io.js"></script>
-    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.22.0/firebase-database-compat.js"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
     <style>
-        body { background: #0b141a; color: #e9edef; font-family: sans-serif; height: 100dvh; display: flex; overflow: hidden; }
-        .sidebar { width: 100%; max-width: 350px; background: #111b21; border-right: 1px solid #222d34; display: flex; flex-direction: column; z-index: 20; transition: all 0.3s; }
-        .main { flex: 1; display: flex; flex-direction: column; background: #0b141a; z-index: 10; }
-        @media (max-width: 768px) {
-            .sidebar { position: absolute; left: -100%; height: 100%; }
-            .sidebar.active { left: 0; }
-        }
-        .bubble { padding: 8px 12px; border-radius: 8px; margin: 4px; max-width: 85%; font-size: 14px; word-wrap: break-word; }
-        .in { background: #202c33; align-self: flex-start; }
-        .out { background: #005c4b; align-self: flex-end; }
-        #overlay { position: fixed; inset: 0; background: #0b141a; z-index: 100; display: flex; flex-direction: column; align-items: center; justify-content: center; }
-        .hidden { display: none !important; }
+        @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;600;800&display=swap');
+        body { font-family: 'Plus Jakarta Sans', sans-serif; background: #05070a; }
+        .glass-card { background: rgba(17, 25, 40, 0.75); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.1); }
+        .status-dot { height: 10px; width: 10px; border-radius: 50%; display: inline-block; }
     </style>
 </head>
-<body>
-    <div id="overlay">
-        <div id="qr-box" class="bg-white p-4 rounded-xl mb-4">Connecting...</div>
-        <p class="text-emerald-500 font-bold">MASTER PRO V7</p>
-    </div>
+<body class="text-slate-200">
 
-    <div class="sidebar" id="sidebar">
-        <div class="p-4 bg-[#202c33] flex justify-between items-center">
-            <h1 class="font-bold text-emerald-500">Chats</h1>
-            <button onclick="toggleSidebar()" class="md:hidden text-gray-400"><i class="fas fa-times"></i></button>
-        </div>
-        <div class="p-3">
-            <button onclick="promptDirect()" class="w-full bg-emerald-600 p-2 rounded font-bold text-sm mb-2"><i class="fas fa-plus mr-2"></i>Direct Message</button>
-        </div>
-        <div id="list" class="flex-1 overflow-y-auto"></div>
-    </div>
-
-    <div class="main">
-        <div id="head" class="p-3 bg-[#202c33] flex items-center border-b border-[#222d34] hidden">
-            <button onclick="toggleSidebar()" class="mr-3 md:hidden"><i class="fas fa-bars"></i></button>
-            <div id="name" class="font-bold flex-1">Chat</div>
-            <div class="flex gap-2">
-                <input id="timer" type="number" placeholder="Sec" class="w-12 bg-[#2a3942] p-1 text-xs rounded">
-                <button onclick="send(true)" class="bg-orange-600 p-1 rounded text-[10px] px-2 font-bold">TIMER</button>
+    <div class="max-w-6xl mx-auto px-4 py-8">
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
+            <div class="glass-card p-6 rounded-3xl">
+                <p class="text-slate-400 text-sm uppercase font-bold tracking-widest">Total Projects</p>
+                <h2 id="total-count" class="text-4xl font-extrabold mt-2 text-blue-500">0</h2>
+            </div>
+            <div class="glass-card p-6 rounded-3xl border-l-4 border-l-emerald-500">
+                <p class="text-slate-400 text-sm uppercase font-bold tracking-widest">Active Pings</p>
+                <h2 id="active-count" class="text-4xl font-extrabold mt-2 text-emerald-500">0</h2>
+            </div>
+            <div class="glass-card p-6 rounded-3xl">
+                <p class="text-slate-400 text-sm uppercase font-bold tracking-widest">Global Status</p>
+                <h2 class="text-2xl font-extrabold mt-2 text-white flex items-center">
+                    <span class="status-dot bg-emerald-500 mr-2 animate-pulse"></span> SYSTEM OK
+                </h2>
             </div>
         </div>
-        <div id="msgs" class="flex-1 overflow-y-auto p-4 flex flex-col">
-            <div class="m-auto text-center opacity-20"><i class="fab fa-whatsapp text-9xl"></i><p>Select a chat</p></div>
+
+        <div class="glass-card p-8 rounded-[2rem] mb-10 shadow-2xl">
+            <h3 class="text-xl font-bold mb-6 flex items-center"><i class="fas fa-satellite-dish mr-3 text-blue-500"></i> Register New Endpoint</h3>
+            <div class="grid grid-cols-1 lg:grid-cols-4 gap-4">
+                <div class="lg:col-span-2">
+                    <input type="url" id="site-url" placeholder="https://your-app.render.com" class="w-full bg-slate-900/50 border border-slate-700 p-4 rounded-2xl outline-none focus:ring-2 focus:ring-blue-500 transition-all">
+                </div>
+                <div class="relative">
+                    <input type="number" id="site-interval" placeholder="Time (Min)" class="w-full bg-slate-900/50 border border-slate-700 p-4 rounded-2xl outline-none focus:ring-2 focus:ring-blue-500 transition-all">
+                    <span class="absolute right-4 top-4 text-slate-500">Min</span>
+                </div>
+                <button onclick="addNewSite()" class="bg-blue-600 hover:bg-blue-500 text-white font-black rounded-2xl p-4 transition-all shadow-lg shadow-blue-500/20 active:scale-95">
+                    START MONITORING
+                </button>
+            </div>
         </div>
-        <div id="input" class="p-3 bg-[#202c33] flex gap-2 hidden">
-            <input id="txt" type="text" placeholder="Type..." class="flex-1 bg-[#2a3942] p-2 rounded-lg outline-none text-sm">
-            <button onclick="send(false)" class="bg-emerald-500 text-black px-4 rounded-lg font-bold"><i class="fas fa-paper-plane"></i></button>
-        </div>
+
+        <div id="sites-container" class="grid grid-cols-1 md:grid-cols-2 gap-6">
+            </div>
     </div>
 
-    <script src="https://www.gstatic.com/firebasejs/9.1.3/firebase-app-compat.js"></script>
-    <script src="https://www.gstatic.com/firebasejs/9.1.3/firebase-database-compat.js"></script>
     <script>
-        const socket = io();
-        firebase.initializeApp(${JSON.stringify(firebaseConfig)});
-        const db = firebase.database();
+        const config = ${JSON.stringify(firebaseConfig)};
+        firebase.initializeApp(config);
+        const database = firebase.database();
+        const rootRef = database.ref('monitored_sites');
 
-        socket.on('qr', url => {
-            document.getElementById('overlay').classList.remove('hidden');
-            document.getElementById('qr-box').innerHTML = \`<img src="\${url}" class="w-64 h-64">\`;
-        });
+        function addNewSite() {
+            const url = document.getElementById('site-url').value;
+            const time = document.getElementById('site-interval').value;
+            if(!url || !time) return alert("Bhai, Details to bharo!");
 
-        socket.on('ready', () => {
-            document.getElementById('overlay').classList.add('hidden');
-            sync();
-        });
-
-        let curJid = null;
-
-        function toggleSidebar() { document.getElementById('sidebar').classList.toggle('active'); }
-
-        function sync() {
-            db.ref('${CHAT_PATH}').on('value', snap => {
-                const list = document.getElementById('list');
-                list.innerHTML = '';
-                snap.forEach(c => {
-                    const data = Object.values(c.val());
-                    const last = data[data.length - 1];
-                    const div = document.createElement('div');
-                    div.className = "p-4 border-b border-[#222d34] cursor-pointer hover:bg-[#202c33]";
-                    div.onclick = () => { openChat(c.key, last.sender, last.jid); if(window.innerWidth < 768) toggleSidebar(); };
-                    div.innerHTML = \`<div class="font-bold text-sm">\${last.sender}</div><div class="text-xs text-gray-500 truncate">\${last.text}</div>\`;
-                    list.appendChild(div);
-                });
+            rootRef.push({
+                url: url,
+                interval: time,
+                enabled: true,
+                status: 'Initialising',
+                lastPing: 'Just Now',
+                responseTime: '...'
             });
+            document.getElementById('site-url').value = '';
         }
 
-        function openChat(id, name, jid) {
-            curJid = jid;
-            document.getElementById('head').classList.remove('hidden');
-            document.getElementById('input').classList.remove('hidden');
-            document.getElementById('name').innerText = name;
-            db.ref('${CHAT_PATH}/' + id).on('value', snap => {
-                const box = document.getElementById('msgs'); box.innerHTML = '';
-                snap.forEach(c => {
-                    const m = c.val();
-                    box.innerHTML += \`<div class="bubble \${m.fromMe ? 'out' : 'in'}">\${m.text}</div>\`;
-                });
-                box.scrollTop = box.scrollHeight;
-            });
-        }
+        function toggle(id, current) { rootRef.child(id).update({ enabled: !current }); }
+        function del(id) { if(confirm('Band kar dein monitoring?')) rootRef.child(id).remove(); }
 
-        async function send(isTimer) {
-            const txt = document.getElementById('txt');
-            const sec = document.getElementById('timer').value;
-            if(!txt.value) return;
-            if(isTimer && !sec) return alert('Enter seconds');
+        rootRef.on('value', (snapshot) => {
+            const data = snapshot.val();
+            const container = document.getElementById('sites-container');
+            container.innerHTML = '';
             
-            if(isTimer) {
-                alert('Scheduled for ' + sec + 's');
-                setTimeout(() => fetch('/send', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ jid: curJid, message: '[Timer]: ' + txt.value }) }), sec * 1000);
-            } else {
-                fetch('/send', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ jid: curJid, message: txt.value }) });
+            if(!data) {
+                document.getElementById('total-count').innerText = '0';
+                document.getElementById('active-count').innerText = '0';
+                return;
             }
-            txt.value = '';
-        }
 
-        function promptDirect() {
-            const num = prompt('Enter WhatsApp Number (with country code, e.g. 91...)');
-            const msg = prompt('Enter Message');
-            if(num && msg) fetch('/send', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ jid: num, message: msg }) });
-        }
+            let activeCount = 0;
+            const keys = Object.keys(data);
+            document.getElementById('total-count').innerText = keys.length;
+
+            keys.forEach(id => {
+                const site = data[id];
+                if(site.enabled) activeCount++;
+                
+                const isUp = site.status === 'Online';
+                
+                container.innerHTML += \`
+                    <div class="glass-card p-6 rounded-3xl transition-all hover:scale-[1.02]">
+                        <div class="flex justify-between items-start mb-4">
+                            <div class="truncate pr-4">
+                                <h4 class="text-blue-400 font-bold truncate">\${site.url}</h4>
+                                <span class="text-[10px] text-slate-500 uppercase tracking-widest">Interval: \${site.interval} Mins</span>
+                            </div>
+                            <span class="\${isUp ? 'bg-emerald-500/10 text-emerald-500' : 'bg-red-500/10 text-red-400'} px-3 py-1 rounded-full text-[10px] font-black uppercase">
+                                \${site.status}
+                            </span>
+                        </div>
+                        
+                        <div class="grid grid-cols-2 gap-4 mb-6">
+                            <div class="bg-slate-900/40 p-3 rounded-xl">
+                                <p class="text-[10px] text-slate-500">RESPONSE</p>
+                                <p class="font-mono text-sm">\${site.responseTime}</p>
+                            </div>
+                            <div class="bg-slate-900/40 p-3 rounded-xl">
+                                <p class="text-[10px] text-slate-500">LAST PING</p>
+                                <p class="text-xs truncate">\${site.lastPing.split(',')[1] || '---'}</p>
+                            </div>
+                        </div>
+
+                        <div class="flex gap-3">
+                            <button onclick="toggle('\${id}', \${site.enabled})" class="flex-1 p-2 rounded-xl text-xs font-bold \${site.enabled ? 'bg-amber-500/20 text-amber-500' : 'bg-emerald-500/20 text-emerald-500'} transition-colors">
+                                \${site.enabled ? '<i class="fas fa-pause mr-1"></i> PAUSE' : '<i class="fas fa-play mr-1"></i> RESUME'}
+                            </button>
+                            <button onclick="del('\${id}')" class="p-2 px-4 rounded-xl bg-red-500/10 text-red-500 hover:bg-red-500 hover:text-white transition-all">
+                                <i class="fas fa-trash-alt"></i>
+                            </button>
+                        </div>
+                    </div>
+                \`;
+            });
+            document.getElementById('active-count').innerText = activeCount;
+        });
     </script>
 </body>
 </html>
     `);
 });
 
-startWhatsApp();
-server.listen(PORT, () => console.log('Live on ' + PORT));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log('--- RENDER ALIVE PRO SYSTEM START ---');
+    // Self-ping logic to keep the pinger itself alive
+    setInterval(() => {
+        const myUrl = process.env.RENDER_EXTERNAL_URL;
+        if(myUrl) axios.get(myUrl).catch(e => console.log("Self ping failed"));
+    }, 10 * 60 * 1000); 
+});

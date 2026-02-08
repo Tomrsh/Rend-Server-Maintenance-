@@ -1,5 +1,5 @@
 {
-  "name": "ww",
+  "name": "s",
   "version": "1.0.0",
   "description": "",
   "main": "index.js",
@@ -11,14 +11,8 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "@whiskeysockets/baileys": "^7.0.0-rc.9",
     "axios": "^1.13.4",
     "express": "^5.2.1",
-    "firebase": "^12.9.0",
-    "mime-types": "^3.0.2",
-    "pino": "^10.3.0",
-    "qrcode": "^1.5.4",
-    "socket.io": "^4.8.3",
-    "uuid": "^13.0.0"
+    "firebase": "^12.9.0"
   }
 }
